@@ -1,8 +1,8 @@
 import type * as sdk from '@anthropic-ai/claude-agent-sdk';
 import { randomUUID } from 'node:crypto';
 import { createGateway, type Session } from './gateway.js';
-import { prepareTranscriptExecutable } from './native-patch.js';
-import type { ContextCallbacks, TranscriptEditor, TranscriptSnapshot, WrapperOptions } from './types.js';
+import type { ContextCallbacks, WrapperOptions } from './types.js';
+import { createContextSession, type ContextSession, type SessionOptions } from './session.js';
 import type { GenerationOptions, GenerationRequest, GenerationResult, GenerationSession } from './generation-types.js';
 import { hasStreamObservers, runGeneration } from './generation.js';
 import { GenerationError } from './errors.js';
@@ -10,10 +10,12 @@ import { GenerationError } from './errors.js';
 export { GenerationError } from './errors.js';
 export type { GenerationErrorKind } from './errors.js';
 export type { GenerationOptions, GenerationRequest, GenerationResult } from './generation-types.js';
+export { SessionError } from './session.js';
+export type { ContextSession, SessionOptions, SessionSnapshot, SessionMessage, HistoryEditor, SessionErrorCode } from './session.js';
 
 export type {
   RequestContext, RequestInfo, CompletedGeneration, GenerationMessage, ContextCallbacks,
-  TranscriptMessage, TranscriptSnapshot, TranscriptEditor, WrapperOptions,
+  WrapperOptions,
 } from './types.js';
 export type QueryParams = Parameters<typeof sdk.query>[0] & { callbacks?: ContextCallbacks };
 const GENERATION = Symbol('generation');
@@ -22,18 +24,14 @@ type InternalQueryParams = QueryParams & { [GENERATION]?: GenerationSession };
 export interface ContextQuery extends sdk.Query {
   /** Wait for the owned CLI to exit after close()/iterator completion. */
   waitForClose(): Promise<void>;
-  /** Read the native CLI's live main-thread transcript, including internal metadata. */
-  getTranscript(): Promise<TranscriptSnapshot>;
-  /** Atomically replace the live transcript if its revision still matches. Requires an idle CLI. */
-  replaceTranscript(snapshot: TranscriptSnapshot): Promise<TranscriptSnapshot>;
-  /** Read, edit a detached copy, and compare-and-swap the live transcript. Requires an idle CLI. */
-  rewriteTranscript(editor: TranscriptEditor): Promise<TranscriptSnapshot>;
 }
 
 export interface ContextAgentSdk {
   query(params: QueryParams): ContextQuery;
   /** Exactly one upstream generation; native CLI tools never execute. No internal retries. */
   generate(request: GenerationRequest, options?: GenerationOptions): Promise<GenerationResult>;
+  /** Create editable wrapper-owned history. Each generation uses a fresh SDK query. */
+  createSession(options?: SessionOptions): ContextSession;
   /** Closes all owned queries and the local interceptor. Always call in finally. */
   close(): Promise<void>;
 }
@@ -48,17 +46,24 @@ export async function wrapAgentSdk(
   original: Pick<typeof sdk, 'query'>,
   options: WrapperOptions = {},
 ): Promise<ContextAgentSdk> {
+  if ('enableTranscriptEditing' in options) {
+    throw new Error('enableTranscriptEditing was removed; use createSession() for wrapper-managed history');
+  }
   const originalQuery = original.query.bind(original);
-  const executable = options.enableTranscriptEditing ? await prepareTranscriptExecutable() : undefined;
-  let gateway: Awaited<ReturnType<typeof createGateway>>;
-  try { gateway = await createGateway(options); }
-  catch (error) { await executable?.dispose(); throw error; }
+  const gateway = await createGateway(options);
   const active = new Set<() => void>();
+  const sessions = new Set<ContextSession>();
   const closingQueries = new Set<Promise<void>>();
   let closed = false;
   let closing: Promise<void> | undefined;
 
   const client: ContextAgentSdk = {
+    createSession(settings = {}) {
+      if (closed) throw new Error('Context SDK wrapper is closed');
+      const session = createContextSession(client, settings, () => sessions.delete(session));
+      sessions.add(session);
+      return session;
+    },
     generate(request, settings = {}) {
       if (closed) return Promise.reject(new Error('Context SDK wrapper is closed'));
       if (options.onGeneration && hasStreamObservers(settings)) return Promise.reject(new Error('Wrapper onGeneration rewriting cannot be combined with live stream observers'));
@@ -66,9 +71,6 @@ export async function wrapAgentSdk(
     },
     query({ callbacks, [GENERATION]: generation, ...params }: InternalQueryParams): ContextQuery {
       if (closed) throw new Error('Context SDK wrapper is closed');
-      if (executable && params.options?.pathToClaudeCodeExecutable) {
-        throw new Error('enableTranscriptEditing cannot be combined with a custom Claude Code executable');
-      }
       const env = { ...(params.options?.env ?? process.env) };
       for (const key of ['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) {
         if (env[key] && env[key] !== '0' && env[key] !== 'false') {
@@ -99,7 +101,7 @@ export async function wrapAgentSdk(
         active.delete(release);
         underlying?.close();
         // Query.close() initiates a graceful shutdown; it does not await child
-        // exit. Retain the SDK transport's exit promise before disposing files.
+        // exit. Retain the SDK transport's exit promise for lifecycle cleanup.
         const transport = (underlying as unknown as { transport?: { waitForExit?(): Promise<void> } })?.transport;
         exited = (transport?.waitForExit?.() ?? Promise.resolve()).catch(() => {});
         closingQueries.add(exited);
@@ -110,42 +112,13 @@ export async function wrapAgentSdk(
       env.NO_PROXY = [env.NO_PROXY, env.no_proxy, '127.0.0.1', 'localhost'].filter(Boolean).join(',');
       env.no_proxy = env.NO_PROXY;
       active.add(release);
-      try { underlying = originalQuery({ ...params, options: {
-        ...params.options, env,
-        ...(executable ? { pathToClaudeCodeExecutable: executable.path } : {}),
-      } }); }
+      try { underlying = originalQuery({ ...params, options: { ...params.options, env } }); }
       catch (error) { generation?.fail(error); release(); throw error; }
 
       const query = underlying;
-      async function transcriptRequest(request: Record<string, unknown>): Promise<TranscriptSnapshot> {
-        if (!executable) throw new Error('Transcript access requires enableTranscriptEditing: true');
-        if (released) throw new Error('Query is closed');
-        const internal = query as unknown as {
-          request(request: Record<string, unknown>): Promise<{ response: TranscriptSnapshot & { context_patch_version?: number } }>;
-        };
-        if (typeof internal.request !== 'function') throw new Error('Unsupported SDK: internal control request method is missing');
-        const { response } = await internal.request({ subtype: 'context_transcript', ...request });
-        if (response?.context_patch_version !== 1 || typeof response.revision !== 'string' || !Array.isArray(response.messages)) {
-          throw new Error('Native transcript patch did not respond with the expected protocol');
-        }
-        return { revision: response.revision, messages: response.messages };
-      }
-      const getTranscript = () => transcriptRequest({ operation: 'read' });
-      const replaceTranscript = (snapshot: TranscriptSnapshot) => transcriptRequest({
-        operation: 'replace', revision: snapshot.revision, messages: structuredClone(snapshot.messages),
-      });
-      const rewriteTranscript = async (editor: TranscriptEditor) => {
-        const snapshot = await getTranscript();
-        const replacement = await editor(snapshot.messages);
-        if (replacement !== undefined) snapshot.messages = replacement;
-        return replaceTranscript(snapshot);
-      };
       const proxy = new Proxy(query, {
         get(target, property) {
           if (property === 'waitForClose') return () => exited ?? Promise.resolve();
-          if (property === 'getTranscript') return getTranscript;
-          if (property === 'replaceTranscript') return replaceTranscript;
-          if (property === 'rewriteTranscript') return rewriteTranscript;
           if (property === Symbol.asyncIterator) return () => proxy;
           if (property === 'close') return release;
           if (property === Symbol.asyncDispose) return async () => release();
@@ -170,8 +143,10 @@ export async function wrapAgentSdk(
     close() {
       if (!closing) {
         closed = true;
+        const sessionClosures = [...sessions].map(session => session.close());
         for (const release of active) release();
-        closing = gateway.close().then(() => Promise.all([...closingQueries])).then(() => {}).finally(() => executable?.dispose());
+        closing = Promise.all([gateway.close(), ...sessionClosures])
+          .then(() => Promise.all([...closingQueries])).then(() => {});
       }
       return closing;
     },

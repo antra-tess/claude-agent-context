@@ -240,7 +240,7 @@ test('rewritten SSE contains only replacement blocks and retains metadata/usage'
   assert.equal(actual.id, message.id);
 });
 
-test('invalid completion replacements fail before delivery; transcript access requires opt-in', async t => {
+test('invalid completion replacements fail before delivery', async t => {
   const upstream = await serve((_req, res) => { res.setHeader('content-type', 'text/event-stream'); res.end(sse()); });
   t.after(() => upstream.close());
   const wrapper = await wrapAgentSdk(fakeSdk({ stream: true }).sdk, {
@@ -248,6 +248,9 @@ test('invalid completion replacements fail before delivery; transcript access re
   });
   t.after(() => wrapper.close());
   const query = wrapper.query({ prompt: 'test' });
-  await assert.rejects(query.getTranscript(), /enableTranscriptEditing/);
   await assert.rejects(collect(query), /valid assistant Message/);
+});
+
+test('native transcript patch option is rejected with a migration message', async () => {
+  await assert.rejects(wrapAgentSdk(fakeSdk().sdk, { enableTranscriptEditing: true } as any), /removed.*createSession/);
 });

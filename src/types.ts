@@ -4,27 +4,6 @@ import type { BetaMessage as Message, MessageCreateParams } from '@anthropic-ai/
 export type RequestContext = MessageCreateParams & Record<string, unknown>;
 export type GenerationMessage = Message;
 
-/** Claude Code's internal transcript entry, including its UUID and metadata. */
-export interface TranscriptMessage {
-  type: string;
-  uuid: string;
-  message?: {
-    role?: string;
-    content: string | Record<string, unknown>[];
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
-export interface TranscriptSnapshot {
-  /** SHA-256 of the live transcript; used for an atomic compare-and-swap write. */
-  revision: string;
-  messages: TranscriptMessage[];
-}
-
-export type TranscriptEditor = (messages: TranscriptMessage[]) =>
-  void | TranscriptMessage[] | Promise<void | TranscriptMessage[]>;
-
 export interface RequestInfo {
   queryId: string;
   requestId: string;
@@ -55,11 +34,6 @@ export interface ContextCallbacks {
 }
 
 export interface WrapperOptions extends ContextCallbacks {
-  /**
-   * Opt in to patching a private native CLI copy for live transcript access.
-   * Currently pinned to SDK 0.3.283 on macOS arm64. Installed binaries are untouched.
-   */
-  enableTranscriptEditing?: boolean;
   /** Override ANTHROPIC_BASE_URL. Defaults to the query env or api.anthropic.com. */
   upstreamUrl?: string;
   /** Timeout for each callback (not generation time). Default: 30 seconds. */

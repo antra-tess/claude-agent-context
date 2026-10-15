@@ -1,11 +1,11 @@
 # claude-agent-context
 
-TypeScript wrapper for the Claude Agent SDK, with a single-generation API and an optional Membrane provider adapter. The original agent-loop API has two awaited callbacks:
+TypeScript wrapper for the Claude Agent SDK, with editable wrapper-managed sessions, a single-generation API, and an optional Membrane provider adapter. The original agent-loop API has two awaited callbacks:
 
 - `beforeRequest(context, info)`: inspect and mutate the fully assembled Messages API payload, or return a replacement.
 - `onGeneration({ request, message, ...info })`: inspect and rewrite each completed model response before Claude Code receives it, stores it, or executes its tools.
 
-Optional native transcript access adds `query.getTranscript()`, `query.rewriteTranscript(editor)`, and `query.replaceTranscript(snapshot)`. These edit **Claude Code’s actual in-memory main-thread transcript**.
+`client.createSession()` maintains editable conversation history in your application. Each session generation uses a fresh SDK query with that history. This library does not patch, rewrite, or re-sign SDK files or Claude Code executables, and does not edit Claude Code's private transcript or caches.
 
 Tested with `@anthropic-ai/claude-agent-sdk@0.3.283` and Node 20. Requires Node 20+ and the direct Anthropic Messages API transport.
 
@@ -25,6 +25,85 @@ In your application:
 ```sh
 npm install /path/to/claude-agent-context
 ```
+
+## Wrapper-managed sessions
+
+A session owns a logical conversation in your application. Its history is supplied to a fresh SDK query for every generation; tools are executed by your application. This API does not attach to an existing `agent.query()` or expose Claude Code's internal transcript.
+
+```ts
+import { createClaudeAgentSdk } from 'claude-agent-context';
+
+const client = await createClaudeAgentSdk();
+try {
+  const session = client.createSession({
+    request: { model: 'claude-sonnet-4-6', max_tokens: 4096 },
+    // Runtime-only options are not included in saved snapshots:
+    // generationOptions: { sdkOptions: { cwd, env: { ...process.env } } },
+  });
+
+  await session.generate({
+    messages: [{ role: 'user', content: 'My project is called Alpha.' }],
+  });
+  await session.rewriteHistory(messages => {
+    messages[0].content = 'My project is called Beta.';
+    // Remove the old assistant response because it may refer to Alpha.
+    messages.splice(1);
+  });
+  const result = await session.generate({
+    messages: [{ role: 'user', content: 'What is my project called?' }],
+  }, {
+    onText: text => { process.stdout.write(text); },
+  });
+  console.log(result.message.usage);
+} finally {
+  await client.close();
+}
+```
+
+`session.generate(request?, options?)` appends the supplied `messages` to the current history for that call. Other request fields override the session's defaults for that call only. A successful generation commits the new input messages and the final assistant response together. A failure, cancellation, or failed callback leaves the history and revision unchanged. Already emitted stream events, upstream charges, and any external callback effects cannot be rolled back. No automatic retries or tool execution are added.
+
+Only one generation may run per session. Mutations, forks, and another generation fail with `SessionError.code === 'busy'` while it is active; other sessions continue independently. `getSnapshot()` returns a detached copy of the last committed state, including while generation is in progress and after the session closes. `session.close()` cancels and awaits only that session's generation. `client.close()` closes all its sessions, raw queries, and the gateway.
+
+### Edit and append history
+
+`rewriteHistory(editor)` accepts synchronous or asynchronous editors that mutate a detached array or return a replacement. A failed editor leaves history unchanged. The commit compares the original revision, so an intervening write causes a `conflict` instead of overwriting it. An editor racing an active generation can fail with `busy`.
+
+For explicit compare-and-swap, including changes to persistent request defaults:
+
+```ts
+const snapshot = session.getSnapshot();
+snapshot.request.messages[0].content = 'Updated user message';
+snapshot.request.max_tokens = 2048;
+session.replaceSnapshot(snapshot);
+```
+
+`replaceSnapshot()` requires the current session ID and revision. Both are opaque; a successful write issues a new revision even if the contents are identical. `SessionError.code` is `closed`, `busy`, `conflict`, or `invalid` for local session errors. Provider and generation failures retain the existing `GenerationError` behavior.
+
+`session.appendMessages(messages)` commits messages without making a model request. For tool use, execute the returned tool calls in your host, then provide matching results on the next generation:
+
+```ts
+await session.generate({ messages: [{
+  role: 'user',
+  content: [{ type: 'tool_result', tool_use_id: toolCall.id, content: toolOutput }],
+}] });
+```
+
+Snapshots may end in pending tool calls, but all pending client tool calls require results before another generation. Local validation rejects orphan or duplicate results, reused tool IDs, invalid message envelopes, and non-JSON state. It does not replace provider validation or verify thinking signatures. Preserve signed thinking and any opaque provider blocks when editing. Editing earlier messages does not automatically revise later replies or undo tool side effects; explicitly truncate or rewrite dependent messages when appropriate.
+
+### Save, restore, and fork
+
+```ts
+const serialized = JSON.stringify(session.getSnapshot()); // Store using your application.
+const restored = client.createSession({ snapshot: JSON.parse(serialized) });
+const branch = session.fork();
+await branch.rewriteHistory(messages => { messages[0].content = 'Try a different premise'; });
+```
+
+A version-1 snapshot contains `sessionId`, `revision`, and `request` (request defaults plus committed messages). Restore and fork create independent session IDs and revisions, so a snapshot cannot accidentally replace another session's history. `request` and `snapshot` are mutually exclusive creation options. Persistence is explicit: this library does not write snapshots to disk automatically.
+
+Snapshots exclude `generationOptions`, including SDK credentials, callbacks, and deadlines; supply these again when restoring. Forks inherit the source session's runtime options in memory. Snapshots still contain the full prompt, tools, metadata, and conversation, which may be sensitive.
+
+Session history records the caller's logical messages and the final, possibly rewritten assistant response. It does not absorb CLI-injected reminders or temporary `beforeRequest` transformations; inspect `GenerationResult.request` for the actual sent payload. Use the session editing API for persistent changes. Native Claude Code transcript metadata, caches, background tasks, and compaction state are not part of a managed session.
 
 ## Single generation (host owns tools and history)
 
@@ -55,7 +134,7 @@ try {
 }
 ```
 
-`generate()` performs **at most one upstream model request**, including when it fails. It starts a fresh local SDK query with a unique sentinel prompt, binds the generation to the request containing that exact prompt, and handles auxiliary calls/competing SDK retries locally. It does not run its own retry loop. The full actual response goes only to the caller; the CLI receives an inert end-turn response. All genuine tool blocks are withheld from the CLI, including while streaming. No native binary patch or transcript-editing support is needed for this mode.
+`generate()` performs **at most one upstream model request**, including when it fails. It starts a fresh local SDK query with a unique sentinel prompt, binds the generation to the request containing that exact prompt, and handles auxiliary calls/competing SDK retries locally. It does not run its own retry loop. The full actual response goes only to the caller; the CLI receives an inert end-turn response. All genuine tool blocks are withheld from the CLI, including while streaming.
 
 ### Keep Claude Code's native request fields
 
@@ -98,7 +177,7 @@ try {
 }
 ```
 
-The adapter implements `complete()` and `stream()`, accepts either `claude-agent/claude-*` or bare `claude-*` model IDs, forwards stop sequences/thinking/sampling/extra parameters, and returns actual model identity, usage/cache counts, stop reasons, raw requests, and raw responses. Membrane owns tool execution, continuation history, and retries. Its abort/deadline options are forwarded, and structured failures become `MembraneError` instances with status and retry hints. Native tool mode with `NativeFormatter` is covered by the end-to-end test. Live streaming also supports Membrane's thinking-tag callback convention.
+The adapter implements `complete()` and `stream()`, accepts either `claude-agent/claude-*` or bare `claude-*` model IDs, forwards stop sequences/thinking/sampling/extra parameters, and returns actual model identity, usage/cache counts, stop reasons, raw requests, and raw responses. Membrane owns tool execution, continuation history, and retries, so the adapter remains stateless and does not add a second managed-session history. Its abort/deadline options are forwarded, and structured failures become `MembraneError` instances with status and retry hints. Native tool mode with `NativeFormatter` is covered by the end-to-end test. Live streaming also supports Membrane's thinking-tag callback convention.
 
 A supplied `client` can share an existing `ContextAgentSdk`; the adapter cancels its own generations on close but leaves that shared client's lifecycle to you. Otherwise it initializes the client lazily and closes it when `adapter.close()` is called.
 
@@ -137,7 +216,7 @@ try {
 }
 ```
 
-`agent.query()` is synchronous and returns a normal SDK `Query` facade. Only wrapper initialization is asynchronous. `query.close()` closes one query; `agent.close()` closes every owned query and the loopback listener. Breaking out of `for await` releases that query. Always close the wrapper when finished, including if a query was created but never iterated. `close()` also removes any temporary patched executable.
+`agent.query()` is synchronous and returns a normal SDK `Query` facade. Only wrapper initialization is asynchronous. `query.close()` closes one query; `agent.close()` closes every owned query, managed session, and the loopback listener. Breaking out of `for await` releases that query. Always close the wrapper when finished, including if a query was created but never iterated.
 
 Callbacks can be overridden per query:
 
@@ -153,47 +232,11 @@ const query = agent.query({
 
 An omitted callback inherits the wrapper default; explicitly setting it to `undefined` disables it for that query.
 
-## Rewrite the native transcript
+## Migrating from 0.2
 
-Enable the version-specific native patch at wrapper initialization:
+Version 0.3 removes the native transcript patch entirely. The `enableTranscriptEditing` option now throws a migration error if supplied, and `query.getTranscript()`, `query.rewriteTranscript()`, `query.replaceTranscript()`, and the native `Transcript*` types are removed. Use `client.createSession()` and its snapshot/history methods for wrapper-managed conversations. Old native transcript snapshots are not compatible with managed-session snapshots.
 
-```ts
-const agent = await createClaudeAgentSdk({ enableTranscriptEditing: true });
-const query = agent.query({ prompt: yourAsyncUserMessageStream });
-
-// Between turns, while the input stream remains open and the CLI is idle:
-const snapshot = await query.getTranscript();
-console.log(snapshot.messages); // Native entries with UUIDs, metadata, and content.
-
-await query.rewriteTranscript(messages => {
-  for (const entry of messages) {
-    if (entry.type === 'user' && entry.message) {
-      entry.message.content = 'Replacement for the earlier user message';
-    }
-  }
-  // Mutate in place or return a replacement entry array. Async editors are supported.
-});
-```
-
-For explicit optimistic concurrency control:
-
-```ts
-const snapshot = await query.getTranscript();
-// Modify snapshot.messages, retaining required entry metadata and unique UUIDs.
-await query.replaceTranscript(snapshot);
-```
-
-The write compares the snapshot's SHA-256 revision with the live transcript and replaces the array's contents atomically inside Claude Code. A stale revision fails instead of overwriting another update. A failed editor callback leaves the transcript untouched. Reads return detached snapshots; changing one alone has no effect.
-
-Use an **async iterable prompt that remains open between turns**. A one-shot string prompt closes the CLI's input and does not provide an ongoing session for later edits. Perform writes after a `result` and before submitting the next user message. An active turn, queued input, pending action, or running background task rejects the write; finish/interrupt active work and wait for it to settle first. `onGeneration` itself runs during the active turn: use its response-rewriting feature there, and rewrite older transcript entries between turns.
-
-The patch exposes the real main-thread array used by subsequent generations, rather than maintaining a separate history in the wrapper. It does not edit active subagent histories, undo already executed tools, or recalculate historical usage. The CLI's read-file cache is cleared after replacement so removed/changed read history cannot leave stale read authorization. The operation is **in-memory only**: existing on-disk transcript records and replayed SDK events are not rewritten, and edits are not guaranteed to survive resume. Preserve internal metadata, valid message envelopes, signed thinking, and tool-call/result pairs. The native write accepts up to 10,000 entries.
-
-### Native patch compatibility
-
-Transcript editing is currently supported only with **SDK 0.3.283 / Claude Code 2.1.283 on macOS arm64**. Other platforms and binary versions fail explicitly when enabling it; ordinary request/response callbacks still work without the native patch. Custom CLI executables cannot be combined with this option.
-
-The patcher checks the SHA-256 fingerprints of the complete executable and the target module before changing anything. It copies the native executable to a private temporary directory, adds a transcript control handler to its embedded headless module, and disables that module's precompiled bytecode so the new handler runs. Existing control handlers are preserved. This uses [Bun's embedded module graph layout](https://github.com/oven-sh/bun/blob/main/src/standalone_graph/StandaloneModuleGraph.rs), not a stable Anthropic API. The private copy is ad-hoc signed with `/usr/bin/codesign`; no privileged install or modification of the vendor binary occurs. Supporting a new build requires inspecting its implementation, updating fingerprints, and rerunning the native integration tests.
+The stateless `generate()`, Membrane adapter, request/response callbacks, and ordinary SDK `query()` facade retain their behavior. Managed sessions do not edit or resume an existing native agent loop; the host owns their history and tool execution. Builds clean `dist/` so obsolete patching code is not included when upgrading an existing checkout.
 
 ## Monkeypatching existing integrations
 
@@ -223,13 +266,13 @@ ES module namespace bindings cannot be assigned to. Patching the facade does not
 
 The Agent SDK launches Claude Code in a subprocess. The [current SDK ships a native CLI binary](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/README.md), so monkeypatching `globalThis.fetch` in your application cannot intercept its requests.
 
-This library wraps/monkeypatches `query` and sets **only that query's subprocess** `ANTHROPIC_BASE_URL` to a loopback interceptor. Each query has an unguessable route and independent callbacks. The interceptor edits `/v1/messages` JSON immediately before forwarding it to the original upstream. Authentication headers are forwarded; credentials are not supplied to callbacks. Installed SDK files and global environment variables are untouched. With transcript editing enabled, a temporary native executable is patched and removed when the wrapper closes.
+This library wraps/monkeypatches `query` and sets **only that query's subprocess** `ANTHROPIC_BASE_URL` to a loopback interceptor. Each query has an unguessable route and independent callbacks. The interceptor edits `/v1/messages` JSON immediately before forwarding it to the original upstream. Authentication headers are forwarded; credentials are not supplied to callbacks. SDK files, executables, and global environment variables are untouched.
 
 Without `onGeneration`, responses stream back with backpressure. With `onGeneration`, **the entire response is buffered**, reconstructed, passed to the callback, and then delivered as a valid SSE stream (or JSON). No original text or tool arguments are delivered before the callback finishes. This adds full-generation latency even for an observer-only callback; leave it unset when you need live token delivery. Unchanged SSE responses retain their original bytes. Rewritten responses retain their message metadata and usage. Other API endpoints pass through without invoking callbacks.
 
 ## Callback semantics and limits
 
-- `beforeRequest` edits the outgoing API payload. `onGeneration` edits what the CLI receives and subsequently stores. `rewriteTranscript` edits earlier entries in the live CLI transcript. Preserve tool-use/tool-result pairing, signed thinking blocks, and valid API structures.
+- `beforeRequest` edits the outgoing API payload. With `query()`, `onGeneration` edits what the CLI receives and subsequently stores. With `generate()` and managed sessions, it edits the response returned to the host. `session.rewriteHistory()` edits the wrapper's committed history for future generations. Preserve tool-use/tool-result pairing, signed thinking blocks, and valid API structures.
 - A generation is one complete API response, not the entire agent run. A tool loop can produce several callbacks. To observe completion of the whole run, consume SDK `result` events. Auxiliary model calls and retries also pass through; `queryId`, `requestId`, and per-query `sequence` identify individual requests. Concurrent model calls may invoke callbacks concurrently.
 - Returning `void` from `beforeRequest` keeps in-place edits. Returning an object replaces the request. Throwing fails the query before transmission. `onGeneration` supports in-place edits to `generation.message`, assignment of a replacement to that property, or returning a replacement Message. Its edited content, tool names/inputs, and stop reason affect what the CLI stores and executes. Keep stop reason consistent with the content. Usage is the original API usage unless you explicitly change it; rewriting text does not recalculate token accounting.
 - Both callbacks are awaited. Exceptions/timeouts close the query and surface the original error through iteration. A failed completion callback occurs **after** the upstream generated its response; it cannot undo that generation. Incomplete/error streams do not produce a completion callback. Interceptor protocol/transport errors fail the query rather than silently bypassing interception.
@@ -246,4 +289,4 @@ Without `onGeneration`, responses stream back with backpressure. With `onGenerat
 npm run check
 ```
 
-The tests cover native request/header/flag preservation, single-generation isolation, live host streaming, all three deadlines, cancellation, structured HTTP/SSE errors, published Membrane integration, request replacement/mutation, tool-loop requests, concurrent query isolation, SSE parsing across individual UTF-8 bytes, completion ordering, failures/timeouts, cancellation/cleanup, monkeypatch restoration, response rewriting (including an actual rewritten `Read` tool call), and the **actual native SDK** talking to a local mock Messages API. On macOS arm64, a native patch test edits earlier user/assistant entries, reads them back from the CLI, and confirms the next API payload uses the edits with no `beforeRequest` callback. It also checks stale/busy/invalid transcript rejection. They use a temporary Claude home and a fake API key; no paid model requests are made. Live Anthropic-service authentication, real model output, and deployment-specific networking are not tested; native SDK integration tests use a local mock API.
+The tests cover native request/header/flag preservation, single-generation isolation, live host streaming, all three deadlines, cancellation, structured HTTP/SSE errors, published Membrane integration, request replacement/mutation, tool-loop requests, concurrent query isolation, SSE parsing across individual UTF-8 bytes, completion ordering, failures/timeouts, cancellation/cleanup, monkeypatch restoration, response rewriting (including an actual rewritten `Read` tool call), and the **actual unmodified native SDK** talking to a local mock Messages API. Managed-session tests verify that edits reach subsequent model requests, failed or cancelled generations leave no partial history, snapshots round-trip through JSON, branches remain isolated, tool-result pairs and signed content survive continuation, and stale/busy/invalid writes are rejected. No test patches or re-signs executables. Native SDK tests use a temporary Claude home and a fake API key; no paid model requests are made. Live Anthropic-service authentication, real model output, and deployment-specific networking are not tested.
